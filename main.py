@@ -2,23 +2,28 @@ import cv2
 import numpy as np
 import tensorflow as tf
 import os
+import time
 from datetime import datetime
+import firebase_admin
+from firebase_admin import credentials, db
 
-# === CONFIGURATION ===
-CAM_URL = "http://192.168.43.249/cam-hi.jpg"  # Change to your ESP32-CAM snapshot URL
+CAM_URL = "http://192.168.43.249:81/stream"
 SAVE_DIR = "captures"
-CONFIDENCE_THRESHOLD = 0.7
+CONFIDENCE_THRESHOLD = 1.0
 IMAGE_SIZE = 256
-DIFF_THRESHOLD = 25  # Sensitivity for movement detection
+CAPTURE_INTERVAL = 5 
 
-# === Prepare environment ===
+cred = credentials.Certificate("serviceAccountKey.json")
+firebase_admin.initialize_app(cred, {
+    'databaseURL': 'https://onionwatch-a9a56-default-rtdb.firebaseio.com/'  
+})
+firebase_ref = db.reference("insect-detections")
+
+model = tf.keras.models.load_model("./model/onionwatch.keras")
+class_names = ['Bangag', 'BlackBug', 'Bugs']
+
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# === Load model ===
-model = tf.keras.models.load_model("./model/onionwatch.keras")  # or .h5
-class_names = ['Bangag', 'BlackBug', 'Bugs']  # Your actual classes
-
-# === Preprocessing ===
 def preprocess_image(img):
     img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
     img = img / 255.0
@@ -33,11 +38,14 @@ def predict_bug(img):
         return class_names[class_idx], confidence
     return None, None
 
-# === Frame difference setup ===
-prev_frame = None
+print("📡 Press SPACE to start/stop capture | Press ENTER to predict/send | Press Q to quit")
 
 cv2.namedWindow("ESP32-CAM Stream", cv2.WINDOW_NORMAL)
-print("📡 Starting OnionWatch AI (Press 'q' to quit)")
+
+capturing = False
+last_capture_time = 0
+image_count = 0
+
 while True:
     try:
         cap = cv2.VideoCapture(CAM_URL)
@@ -48,49 +56,57 @@ while True:
             print("⚠️ Failed to read frame")
             continue
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_blur = cv2.GaussianBlur(gray, (21, 21), 0)
+        now = time.time()
 
-        if prev_frame is None:
-            prev_frame = gray_blur
-            cv2.imshow("ESP32-CAM Stream", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            continue
+        if capturing and now - last_capture_time >= CAPTURE_INTERVAL:
+            filename = f"{SAVE_DIR}/img_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            cv2.imwrite(filename, frame)
+            image_count += 1
+            last_capture_time = now
+            print(f"📸 Captured: {filename}")
 
-        # === Compute absolute difference between frames ===
-        frame_diff = cv2.absdiff(prev_frame, gray_blur)
-        thresh = cv2.threshold(frame_diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)[1]
-        thresh = cv2.dilate(thresh, None, iterations=2)
-
-        contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        bug_detected = False
-        for contour in contours:
-            if cv2.contourArea(contour) > 500:  # Adjust area threshold if needed
-                bug_detected = True
-                break
-
-        # === If bug/insect is detected ===
-        if bug_detected:
-            print("🪲 Movement detected! Predicting...")
-            predicted_class, confidence = predict_bug(frame)
-            if predicted_class:
-                filename = f"{SAVE_DIR}/{predicted_class}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-                cv2.imwrite(filename, frame)
-                print(f"✅ Detected {predicted_class} ({confidence*100:.2f}%). Saved at {filename}")
-            else:
-                print("❌ Movement detected, but no insect confidently classified.")
-
-        # Show the stream
         cv2.imshow("ESP32-CAM Stream", frame)
 
-        # Press 'q' to quit
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        key = cv2.waitKey(1) & 0xFF
 
-        # Update the previous frame
-        prev_frame = gray_blur
+        if key == ord(' '): 
+            capturing = not capturing
+            state = "started" if capturing else "stopped"
+            print(f"⏯️ Capture {state}.")
+
+        elif key == 13: 
+            print("🔍 Predicting saved images...")
+            send_count = 0
+            for fname in os.listdir(SAVE_DIR):
+                if fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    path = os.path.join(SAVE_DIR, fname)
+                    img = cv2.imread(path)
+
+                    if img is None:
+                        continue
+
+                    predicted_class, confidence = predict_bug(img)
+                    if predicted_class:
+                        print(f"✅ {fname} = {predicted_class} ({confidence*100:.2f}%)")
+
+                        data = {
+                            "filename": fname,
+                            "predicted_class": predicted_class,
+                            "confidence": float(confidence),
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        firebase_ref.push(data)
+                        send_count += 1
+                    else:
+                        print(f"❌ {fname} not confidently classified.")
+
+                    os.remove(path)
+
+            print(f"📤 Done. {send_count} classified results sent to Firebase.")
+
+        elif key == ord('q'):
+            print("👋 Exiting...")
+            break
 
     except Exception as e:
         print(f"🚨 Error: {e}")
